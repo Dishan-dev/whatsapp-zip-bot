@@ -1,0 +1,22 @@
+services:
+  bot:
+    build: .
+    container_name: whatsapp-zip-bot
+    restart: unless-stopped
+    init: true # reaps leftover Chromium processes
+    env_file: .env
+    environment:
+      # these win over .env, which may hold Windows-only values
+      CHROME_PATH: /usr/bin/chromium
+      SESSION_DIR: /data/session
+      HEADLESS: "true"
+    volumes:
+      - bot-data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  bot-data:
