@@ -66,6 +66,7 @@ const CLIENT_ID = 'zip-bot';
 // (typed on the bot's phone) instead of scanning a QR code.
 const PAIRING_NUMBER = digits(process.env.PAIRING_NUMBER);
 const HEADLESS = process.env.HEADLESS !== 'false';
+const AUTH_TIMEOUT_MS = Number(process.env.AUTH_TIMEOUT_SEC || 180) * 1000;
 const MAX_ZIP_MB = Number(process.env.MAX_ZIP_MB || 100);
 const MAX_ZIP_BYTES = MAX_ZIP_MB * 1024 * 1024;
 const ACK_DELAY_MS = 3000; // wait for a burst of files to finish before replying once
@@ -179,8 +180,16 @@ const client = new Client({
     puppeteer: {
         headless: HEADLESS,
         executablePath: CHROME_PATH,
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--no-first-run']
+        args: [
+            '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--no-first-run',
+            // lighter on small servers
+            '--disable-gpu', '--disable-extensions', '--mute-audio',
+            '--disable-background-networking', '--disable-default-apps', '--disable-sync'
+        ]
     },
+    // How long WhatsApp Web may take to load. The library default (30s) is too short for
+    // small shared-CPU servers, which then fail with "auth timeout".
+    authTimeoutMs: AUTH_TIMEOUT_MS,
     ...(PAIRING_NUMBER && { pairWithPhoneNumber: { phoneNumber: PAIRING_NUMBER, showNotification: true } })
 });
 
