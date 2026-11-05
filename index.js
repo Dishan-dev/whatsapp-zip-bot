@@ -1,7 +1,8 @@
 /**
  * WhatsApp ZIP bot
  * ----------------
- * Only the number in TARGET_NUMBER (.env) can use it.
+ * Only the number(s) in TARGET_NUMBER (.env, comma separated) can use it.
+ * Each number has its own queue, so their files never mix.
  *
  *   1. They send files (photos, videos, documents, audio).
  *   2. They send a text message  ->  that text becomes the ZIP name.
@@ -27,22 +28,43 @@ const path = require('path');
 
 const digits = (s) => String(s || '').replace(/\D/g, '');
 
-const TARGET_NUMBER = digits(process.env.TARGET_NUMBER);
-if (!TARGET_NUMBER) {
+// One or more allowed numbers, comma separated: TARGET_NUMBER=94771234567,94767654321
+const TARGET_NUMBERS = [
+    ...new Set(
+        String(process.env.TARGET_NUMBER || '')
+            .split(',')
+            .map(digits)
+            .filter(Boolean)
+    )
+];
+if (!TARGET_NUMBERS.length) {
     console.error('❌ TARGET_NUMBER is not set. Copy .env.example to .env and fill it in.');
     process.exit(1);
 }
 
-// Optional extra WhatsApp IDs for the same person (e.g. "123456789@lid"), comma separated
-const EXTRA_IDS = (process.env.TARGET_IDS || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
+// Optional extra WhatsApp IDs (e.g. "123456789@lid"), comma separated.
+// Write "<number>=<id>" to say whose ID it is; a bare ID belongs to the first number.
+const EXTRA_IDS = new Map(); // id -> number
+for (const entry of String(process.env.TARGET_IDS || '').split(',')) {
+    const s = entry.trim();
+    if (!s) continue;
+    const eq = s.indexOf('=');
+    const num = eq > 0 ? digits(s.slice(0, eq)) : TARGET_NUMBERS[0];
+    const id = eq > 0 ? s.slice(eq + 1).trim() : s;
+    if (!TARGET_NUMBERS.includes(num)) {
+        console.error(`❌ TARGET_IDS entry "${s}" names +${num}, which is not in TARGET_NUMBER.`);
+        process.exit(1);
+    }
+    if (id) EXTRA_IDS.set(id, num);
+}
 
 const CHROME_PATH = process.env.CHROME_PATH || undefined; // unset = puppeteer's own Chromium
 // Where the WhatsApp login is kept. On Railway/Render point this at a persistent volume.
 const SESSION_DIR = process.env.SESSION_DIR || path.join(__dirname, '.wwebjs_auth');
 const CLIENT_ID = 'zip-bot';
+// Optional: the BOT's own number. When set, log in with an 8-character pairing code
+// (typed on the bot's phone) instead of scanning a QR code.
+const PAIRING_NUMBER = digits(process.env.PAIRING_NUMBER);
 const HEADLESS = process.env.HEADLESS !== 'false';
 const MAX_ZIP_MB = Number(process.env.MAX_ZIP_MB || 100);
 const MAX_ZIP_BYTES = MAX_ZIP_MB * 1024 * 1024;
@@ -74,16 +96,28 @@ const OUT_DIR = path.join(WORK_DIR, 'out');
 
 // ---------------------------------------------------------------- state
 
-const queue = {
-    files: [], // { path, name, size }
-    bytes: 0,
-    usedNames: new Set(), // lower-case, so Windows case-insensitivity can't collide
-    counters: {},
-    ackTimer: null,
-    newSinceAck: 0
-};
+// One queue per allowed number, so two people's files never mix
+const queues = new Map(); // number -> queue
 
-function resetQueue() {
+function getQueue(num) {
+    let q = queues.get(num);
+    if (!q) {
+        q = {
+            files: [], // { path, name, size }
+            bytes: 0,
+            usedNames: new Set(), // lower-case, so Windows case-insensitivity can't collide
+            counters: {},
+            ackTimer: null,
+            newSinceAck: 0,
+            filesDir: path.join(FILES_DIR, num),
+            outDir: path.join(OUT_DIR, num)
+        };
+        queues.set(num, q);
+    }
+    return q;
+}
+
+function resetQueue(queue) {
     queue.files = [];
     queue.bytes = 0;
     queue.usedNames.clear();
@@ -115,7 +149,7 @@ function extForMime(mime) {
     return /^[a-z0-9]{1,5}$/.test(sub) ? sub : 'bin';
 }
 
-function uniqueName(name) {
+function uniqueName(queue, name) {
     const { name: base, ext } = path.parse(name);
     let candidate = name;
     let i = 2;
@@ -146,7 +180,8 @@ const client = new Client({
         headless: HEADLESS,
         executablePath: CHROME_PATH,
         args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--no-first-run']
-    }
+    },
+    ...(PAIRING_NUMBER && { pairWithPhoneNumber: { phoneNumber: PAIRING_NUMBER, showNotification: true } })
 });
 
 /** Send without marking the chat as seen (avoids a known WhatsApp Web error). */
@@ -160,37 +195,41 @@ async function say(chatId, text) {
 
 // ---------------------------------------------------------------- who is allowed
 
-const idCache = new Map(); // chatId -> { ok, at }
+const idCache = new Map(); // chatId -> { num, at }
 const NEGATIVE_TTL_MS = 10 * 60 * 1000; // re-check "not target" after 10 min (in case a lookup failed)
 const loggedIgnored = new Set();
 
-async function isTarget(msg) {
-    const id = msg.from;
-    if (!id || msg.fromMe) return false;
-    if (id.endsWith('@g.us') || id.endsWith('@broadcast') || id.endsWith('@newsletter')) return false;
+const allowed = (n) => (TARGET_NUMBERS.includes(digits(n)) ? digits(n) : null);
 
-    if (id === `${TARGET_NUMBER}@c.us` || EXTRA_IDS.includes(id)) return true;
+/** Returns the allowed number this message came from, or null. */
+async function senderNumber(msg) {
+    const id = msg.from;
+    if (!id || msg.fromMe) return null;
+    if (id.endsWith('@g.us') || id.endsWith('@broadcast') || id.endsWith('@newsletter')) return null;
+
+    if (id.endsWith('@c.us') && allowed(id.split('@')[0])) return allowed(id.split('@')[0]);
+    if (EXTRA_IDS.has(id)) return EXTRA_IDS.get(id);
 
     const hit = idCache.get(id);
-    if (hit && (hit.ok || Date.now() - hit.at < NEGATIVE_TTL_MS)) return hit.ok;
+    if (hit && (hit.num || Date.now() - hit.at < NEGATIVE_TTL_MS)) return hit.num;
 
-    let ok = false;
+    let num = null;
     try {
         const contact = await msg.getContact();
-        if (contact && digits(contact.number) === TARGET_NUMBER) ok = true;
+        if (contact) num = allowed(contact.number);
 
         // Newer WhatsApp "@lid" IDs hide the phone number; ask WhatsApp to map it back.
-        if (!ok && id.endsWith('@lid') && typeof client.getContactLidAndPhone === 'function') {
+        if (!num && id.endsWith('@lid') && typeof client.getContactLidAndPhone === 'function') {
             const map = await client.getContactLidAndPhone([id]);
-            if (map && map[0] && digits(map[0].pn) === TARGET_NUMBER) ok = true;
+            if (map && map[0]) num = allowed(map[0].pn);
         }
     } catch (e) {
         console.log(`Could not resolve ${id}: ${e.message || e}`);
     }
 
-    idCache.set(id, { ok, at: Date.now() });
-    if (ok) console.log(`✔ ${id} identified as +${TARGET_NUMBER}`);
-    return ok;
+    idCache.set(id, { num, at: Date.now() });
+    if (num) console.log(`✔ ${id} identified as +${num}`);
+    return num;
 }
 
 // ---------------------------------------------------------------- message handling
@@ -202,7 +241,8 @@ client.on('message', (msg) => {
 });
 
 async function handleMessage(msg) {
-    if (!(await isTarget(msg))) {
+    const num = await senderNumber(msg);
+    if (!num) {
         if (msg.from && !msg.from.endsWith('@g.us') && !loggedIgnored.has(msg.from)) {
             loggedIgnored.add(msg.from);
             console.log(`(ignored) ${msg.from}`);
@@ -212,19 +252,20 @@ async function handleMessage(msg) {
 
     fixMessageId(msg);
     const chatId = msg.from;
+    const queue = getQueue(num);
 
-    if (msg.hasMedia) return handleMedia(msg, chatId);
+    if (msg.hasMedia) return handleMedia(msg, chatId, queue);
 
     const text = (msg.body || '').trim();
     if (!text) return;
 
     const cmd = text.toLowerCase();
     if (cmd === '/help' || cmd === '/start') return sendHelp(chatId);
-    if (cmd === '/status') return sendStatus(chatId);
+    if (cmd === '/status') return sendStatus(chatId, queue);
     if (cmd === '/cancel') {
         const n = queue.files.length;
-        resetQueue();
-        await clearDir(FILES_DIR);
+        resetQueue(queue);
+        await clearDir(queue.filesDir);
         return say(chatId, n ? `Cancelled. ${n} file(s) discarded.` : 'Nothing to cancel.');
     }
 
@@ -235,7 +276,7 @@ async function handleMessage(msg) {
     const zipName = safeName(text, 100);
     if (!zipName) return say(chatId, 'That name has no usable characters. Try another name.');
 
-    await zipAndSend(chatId, zipName);
+    await zipAndSend(chatId, queue, zipName);
 }
 
 /**
@@ -249,7 +290,7 @@ function fixMessageId(msg) {
     id._serialized = id.$1 || `${id.fromMe}_${id.remote}_${id.id}`;
 }
 
-async function handleMedia(msg, chatId) {
+async function handleMedia(msg, chatId, queue) {
     if (!ALLOWED_TYPES.has(msg.type)) {
         return say(chatId, `Skipped a ${msg.type} — I only zip photos, videos, documents and audio.`);
     }
@@ -283,10 +324,10 @@ async function handleMedia(msg, chatId) {
         name = `${prefix}_${String(queue.counters[prefix]).padStart(3, '0')}`;
     }
     if (!path.extname(name)) name += '.' + extForMime(media.mimetype);
-    name = uniqueName(name);
+    name = uniqueName(queue, name);
 
-    await fsp.mkdir(FILES_DIR, { recursive: true });
-    const filePath = path.join(FILES_DIR, name);
+    await fsp.mkdir(queue.filesDir, { recursive: true });
+    const filePath = path.join(queue.filesDir, name);
     await fsp.writeFile(filePath, buf);
 
     queue.files.push({ path: filePath, name, size: buf.length });
@@ -309,17 +350,17 @@ async function handleMedia(msg, chatId) {
     }, ACK_DELAY_MS);
 }
 
-async function zipAndSend(chatId, zipName) {
+async function zipAndSend(chatId, queue, zipName) {
     if (queue.ackTimer) clearTimeout(queue.ackTimer);
     queue.ackTimer = null;
 
     const files = [...queue.files];
-    const zipPath = path.join(OUT_DIR, `${zipName}.zip`);
+    const zipPath = path.join(queue.outDir, `${zipName}.zip`);
     console.log(`🚀 Zipping ${files.length} file(s) → ${zipName}.zip`);
 
     try {
         await say(chatId, `Zipping ${files.length} file(s) into "${zipName}.zip"...`);
-        await fsp.mkdir(OUT_DIR, { recursive: true });
+        await fsp.mkdir(queue.outDir, { recursive: true });
         const size = await createZip(files, zipPath);
 
         if (size > MAX_ZIP_BYTES) throw new Error(`ZIP is ${fmtSize(size)}, over the ${MAX_ZIP_MB} MB limit`);
@@ -335,9 +376,9 @@ async function zipAndSend(chatId, zipName) {
         console.error('ZIP error:', err.stack || err);
         await say(chatId, `Sorry, something went wrong making the ZIP: ${err.message || err}`);
     } finally {
-        resetQueue();
-        await clearDir(FILES_DIR);
-        await clearDir(OUT_DIR);
+        resetQueue(queue);
+        await clearDir(queue.filesDir);
+        await clearDir(queue.outDir);
     }
 }
 
@@ -371,7 +412,7 @@ function sendHelp(chatId) {
     );
 }
 
-function sendStatus(chatId) {
+function sendStatus(chatId, queue) {
     if (!queue.files.length) return say(chatId, 'Queue is empty. Send some files.');
     const list = queue.files
         .slice(0, 30)
@@ -391,6 +432,12 @@ client.on('qr', (qr) => {
     qrcode.generate(qr, { small: true });
     console.log('\nScan this QR code with the WhatsApp account the bot should run on');
     console.log('(WhatsApp → Settings → Linked devices → Link a device).');
+});
+client.on('code', (code) => {
+    const pretty = String(code).replace(/^(.{4})(.{4})$/, '$1-$2');
+    console.log(`\n🔑 Pairing code for +${PAIRING_NUMBER}:  ${pretty}`);
+    console.log('On the bot\'s phone: WhatsApp → Settings → Linked devices → Link a device →');
+    console.log('"Link with phone number instead" → enter this code. A new code comes every 3 minutes.');
 });
 let readyWatchdog = null;
 client.on('authenticated', () => {
@@ -442,7 +489,7 @@ client.on('disconnected', (r) => {
 });
 client.on('ready', () => {
     if (readyWatchdog) clearTimeout(readyWatchdog);
-    console.log(`✅ Ready. Only responding to +${TARGET_NUMBER}`);
+    console.log(`✅ Ready. Only responding to ${TARGET_NUMBERS.map((n) => '+' + n).join(', ')}`);
 });
 
 async function shutdown() {
