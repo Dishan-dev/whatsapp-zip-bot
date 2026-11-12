@@ -243,9 +243,25 @@ async function senderNumber(msg) {
 
 // ---------------------------------------------------------------- message handling
 
+// whatsapp-web.js re-attaches its listeners whenever WhatsApp Web reloads inside the
+// browser, so the same message can be emitted several times. Handle each id once.
+const seenMsgIds = new Set();
+const SEEN_MAX = 5000;
+
+function firstTime(msg) {
+    fixMessageId(msg);
+    const key = msg.id && msg.id._serialized;
+    if (!key) return true; // can't tell, so don't drop it
+    if (seenMsgIds.has(key)) return false;
+    seenMsgIds.add(key);
+    if (seenMsgIds.size > SEEN_MAX) seenMsgIds.delete(seenMsgIds.values().next().value); // oldest
+    return true;
+}
+
 // Handle messages strictly one at a time, in order
 let chain = Promise.resolve();
 client.on('message', (msg) => {
+    if (!firstTime(msg)) return;
     chain = chain.then(() => handleMessage(msg)).catch((e) => console.error('Handler error:', e.stack || e));
 });
 
@@ -448,9 +464,17 @@ client.on('code', (code) => {
     console.log('On the bot\'s phone: WhatsApp → Settings → Linked devices → Link a device →');
     console.log('"Link with phone number instead" → enter this code. A new code comes every 3 minutes.');
 });
+// The same re-attach also repeats "authenticated"/"ready"; log each once per burst
+const lastLogged = {};
+function logOnce(key, text, windowMs = 30 * 1000) {
+    if (lastLogged[key] && Date.now() - lastLogged[key] < windowMs) return;
+    lastLogged[key] = Date.now();
+    console.log(text);
+}
+
 let readyWatchdog = null;
 client.on('authenticated', () => {
-    console.log('🔐 Authenticated');
+    logOnce('auth', '🔐 Authenticated');
     // whatsapp-web.js swallows errors between "authenticated" and "ready", so if
     // ready never comes, probe each startup step ourselves and report what broke.
     if (readyWatchdog) clearTimeout(readyWatchdog);
@@ -498,7 +522,7 @@ client.on('disconnected', (r) => {
 });
 client.on('ready', () => {
     if (readyWatchdog) clearTimeout(readyWatchdog);
-    console.log(`✅ Ready. Only responding to ${TARGET_NUMBERS.map((n) => '+' + n).join(', ')}`);
+    logOnce('ready', `✅ Ready. Only responding to ${TARGET_NUMBERS.map((n) => '+' + n).join(', ')}`);
 });
 
 async function shutdown() {
